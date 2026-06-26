@@ -96,16 +96,29 @@ Mensagem: {texto or audio_texto or 'Analise o comprovante da imagem.'}
         "generationConfig": {"temperature": 0.1, "maxOutputTokens": 500}
     }
 
-    r = requests.post(
-        f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=30
-    )
+  try:
+        r = requests.post(
+            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            json=payload,
+            headers={"Content-Type": "application/json"},
+            timeout=30
+        )
+        resposta_json = r.json()
+        
+        # CORREÇÃO: Valida se a IA respondeu corretamente antes de buscar as chaves
+        if "candidates" in resposta_json and len(resposta_json["candidates"]) > 0:
+            candidate = resposta_json["candidates"][0]
+            if "content" in candidate and "parts" in candidate["content"]:
+                raw = candidate["content"]["parts"][0]["text"].strip()
+                raw = raw.replace("```json", "").replace("```", "").strip()
+                return json.loads(raw)
+        
+            print(f"Erro ou estrutura inesperada do Gemini: {resposta_json}")
+            return {"encontrou": False, "resposta": "Desculpe, a IA não gerou uma resposta válida."}
 
-    raw = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-    raw = raw.replace("```json","").replace("```","").strip()
-    return json.loads(raw)
+    except Exception as e:
+        print(f"Erro ao processar mensagem no Gemini: {e}")
+        return {"encontrou": False, "resposta": "Estou instável no momento. Tente novamente."}
 
 # ─── EVOLUTION API: ENVIAR MENSAGEM ──────────────────────────────
 def enviar_whatsapp(numero, mensagem):
