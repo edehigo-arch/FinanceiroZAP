@@ -10,6 +10,9 @@ app = Flask(__name__)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL", "")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY", "")
+EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE", "financeirozap")
 
 # ─── BANCO DE DADOS ───────────────────────────────────────────────
 def get_db():
@@ -53,7 +56,7 @@ def init_db():
     db.commit()
     db.close()
 
-# ─── GEMINI AI: INTERPRETAR MENSAGEM ──────────────────────────────
+# ─── GEMINI AI ────────────────────────────────────────────────────
 def interpretar_mensagem(texto=None, imagem_base64=None, audio_texto=None):
     categorias = [
         "Alimentação","Transporte","Saúde","Lazer","Moradia",
@@ -85,22 +88,12 @@ Mensagem: {texto or audio_texto or 'Analise o comprovante da imagem.'}
 """
 
     parts = [{"text": prompt}]
-
-    # Se tiver imagem, adiciona
     if imagem_base64:
-        parts.append({
-            "inline_data": {
-                "mime_type": "image/jpeg",
-                "data": imagem_base64
-            }
-        })
+        parts.append({"inline_data": {"mime_type": "image/jpeg", "data": imagem_base64}})
 
     payload = {
         "contents": [{"parts": parts}],
-        "generationConfig": {
-            "temperature": 0.1,
-            "maxOutputTokens": 500
-        }
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 500}
     }
 
     r = requests.post(
@@ -114,90 +107,89 @@ Mensagem: {texto or audio_texto or 'Analise o comprovante da imagem.'}
     raw = raw.replace("```json","").replace("```","").strip()
     return json.loads(raw)
 
-# ─── WHATSAPP: ENVIAR MENSAGEM ─────────────────────────────────────
+# ─── EVOLUTION API: ENVIAR MENSAGEM ──────────────────────────────
 def enviar_whatsapp(numero, mensagem):
-    token = os.getenv("WHATSAPP_TOKEN")
-    phone_id = os.getenv("WHATSAPP_PHONE_ID")
-    if not token or not phone_id:
-        print(f"[WhatsApp desconectado] Mensagem para {numero}: {mensagem}")
+    if not EVOLUTION_API_URL or not EVOLUTION_API_KEY:
+        print(f"[WhatsApp] {numero}: {mensagem}")
         return
-    url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    payload = {
-        "messaging_product": "whatsapp",
-        "to": numero,
-        "type": "text",
-        "text": {"body": mensagem}
-    }
-    requests.post(url, headers=headers, json=payload)
+    url = f"{EVOLUTION_API_URL}/message/sendText/{EVOLUTION_INSTANCE}"
+    headers = {"apikey": EVOLUTION_API_KEY, "Content-Type": "application/json"}
+    payload = {"number": numero, "text": mensagem}
+    try:
+        requests.post(url, headers=headers, json=payload, timeout=10)
+    except Exception as e:
+        print(f"Erro ao enviar WhatsApp: {e}")
 
-# ─── WHATSAPP: WEBHOOK ─────────────────────────────────────────────
+# ─── WEBHOOK EVOLUTION API ────────────────────────────────────────
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
-    verify_token = os.getenv("WEBHOOK_VERIFY_TOKEN", "financeiro_token_2024")
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
-    if mode == "subscribe" and token == verify_token:
-        return challenge, 200
-    return "Forbidden", 403
+    return jsonify({"status": "ok"})
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
     try:
-        entry = data["entry"][0]["changes"][0]["value"]
-        messages = entry.get("messages", [])
+        # Formato Evolution API
+        event = data.get("event", "")
+        if event != "messages.upsert":
+            return jsonify({"status": "ok"})
 
-        for msg in messages:
-            numero = msg["from"]
-            tipo_msg = msg["type"]
+        msg_data = data.get("data", {})
+        key = msg_data.get("key", {})
+        
+        # Ignorar mensagens enviadas pelo próprio bot
+        if key.get("fromMe", False):
+            return jsonify({"status": "ok"})
 
-            imagem_b64 = None
-            audio_texto = None
-            texto = None
+        numero = key.get("remoteJid", "").replace("@s.whatsapp.net", "")
+        message = msg_data.get("message", {})
 
-            if tipo_msg == "text":
-                texto = msg["text"]["body"]
-                if texto.lower() in ["resumo", "relatório", "relatorio", "saldo"]:
-                    resposta = gerar_resumo_texto()
-                    enviar_whatsapp(numero, resposta)
-                    continue
+        texto = None
+        imagem_b64 = None
 
-            elif tipo_msg == "image":
-                media_id = msg["image"]["id"]
-                imagem_b64 = baixar_media_base64(media_id)
+        # Texto simples
+        if "conversation" in message:
+            texto = message["conversation"]
+        elif "extendedTextMessage" in message:
+            texto = message["extendedTextMessage"]["text"]
+        elif "imageMessage" in message:
+            # Imagem - por enquanto tratar como texto
+            texto = "comprovante enviado por imagem"
 
-            elif tipo_msg == "audio":
-                media_id = msg["audio"]["id"]
-                audio_texto = f"[áudio recebido - id:{media_id}]"
+        if not texto:
+            return jsonify({"status": "ok"})
 
-            resultado = interpretar_mensagem(texto, imagem_b64, audio_texto)
-
-            if resultado.get("encontrou"):
-                salvar_transacao(resultado, fonte="whatsapp")
-                emoji = "💸" if resultado["tipo"] == "despesa" else "💰"
-                resposta = f"{emoji} {resultado['resposta']}\n\n📊 Digite *resumo* para ver seu saldo."
-            else:
-                resposta = resultado.get("resposta", "Não entendi. Tente: 'gastei 50 no mercado' ou 'recebi 1000 de salário'")
-
+        # Comandos especiais
+        if texto.lower() in ["resumo", "relatório", "relatorio", "saldo", "r"]:
+            resposta = gerar_resumo_texto()
             enviar_whatsapp(numero, resposta)
+            return jsonify({"status": "ok"})
+
+        if texto.lower() in ["ajuda", "help", "?"]:
+            resposta = ("💡 *Como usar o FinanceiroZAP:*\n\n"
+                       "💸 'gastei 50 no uber'\n"
+                       "💰 'recebi 3000 de salário'\n"
+                       "🏥 'paguei 120 na farmácia'\n"
+                       "📊 'resumo' → ver saldo do mês")
+            enviar_whatsapp(numero, resposta)
+            return jsonify({"status": "ok"})
+
+        # Interpretar com Gemini
+        resultado = interpretar_mensagem(texto)
+
+        if resultado.get("encontrou"):
+            salvar_transacao(resultado, fonte="whatsapp")
+            emoji = "💸" if resultado["tipo"] == "despesa" else "💰"
+            resposta = f"{emoji} {resultado['resposta']}\n\n📊 Digite *resumo* para ver seu saldo."
+        else:
+            resposta = resultado.get("resposta", "Não entendi. Tente: 'gastei 50 no mercado'\nDigite *ajuda* para ver exemplos.")
+
+        enviar_whatsapp(numero, resposta)
 
     except Exception as e:
         print(f"Erro webhook: {e}")
 
     return jsonify({"status": "ok"})
-
-def baixar_media_base64(media_id):
-    token = os.getenv("WHATSAPP_TOKEN")
-    if not token:
-        return None
-    url = f"https://graph.facebook.com/v18.0/{media_id}"
-    headers = {"Authorization": f"Bearer {token}"}
-    r = requests.get(url, headers=headers)
-    media_url = r.json().get("url")
-    r2 = requests.get(media_url, headers=headers)
-    return base64.b64encode(r2.content).decode()
 
 def salvar_transacao(dados, fonte="manual"):
     db = get_db()
@@ -216,6 +208,12 @@ def gerar_resumo_texto():
         SELECT tipo, SUM(valor) as total FROM transacoes
         WHERE data LIKE ? GROUP BY tipo
     """, (f"{mes_atual}%",)).fetchall()
+    
+    por_cat = db.execute("""
+        SELECT categoria, SUM(valor) as total FROM transacoes
+        WHERE data LIKE ? AND tipo='despesa'
+        GROUP BY categoria ORDER BY total DESC LIMIT 3
+    """, (f"{mes_atual}%",)).fetchall()
     db.close()
 
     receitas = next((r["total"] for r in rows if r["tipo"] == "receita"), 0)
@@ -223,58 +221,38 @@ def gerar_resumo_texto():
     saldo = receitas - despesas
     emoji = "✅" if saldo >= 0 else "⚠️"
 
-    return (f"📊 *Resumo {datetime.now().strftime('%B/%Y')}*\n\n"
-            f"💰 Receitas: R$ {receitas:,.2f}\n"
-            f"💸 Despesas: R$ {despesas:,.2f}\n"
-            f"{emoji} Saldo: R$ {saldo:,.2f}")
+    resumo = (f"📊 *Resumo {datetime.now().strftime('%B/%Y')}*\n\n"
+              f"💰 Receitas: R$ {receitas:,.2f}\n"
+              f"💸 Despesas: R$ {despesas:,.2f}\n"
+              f"{emoji} Saldo: R$ {saldo:,.2f}")
+    
+    if por_cat:
+        resumo += "\n\n🏆 *Top despesas:*"
+        for c in por_cat:
+            resumo += f"\n• {c['categoria']}: R$ {c['total']:,.2f}"
+    
+    return resumo
 
-# ─── API PARA O DASHBOARD ─────────────────────────────────────────
+# ─── API DASHBOARD ────────────────────────────────────────────────
 @app.route("/api/resumo")
 def api_resumo():
     db = get_db()
     mes = request.args.get("mes", datetime.now().strftime("%Y-%m"))
-
-    totais = db.execute("""
-        SELECT tipo, SUM(valor) as total FROM transacoes
-        WHERE data LIKE ? GROUP BY tipo
-    """, (f"{mes}%",)).fetchall()
-
-    por_categoria = db.execute("""
-        SELECT categoria, tipo, SUM(valor) as total, COUNT(*) as qtd
-        FROM transacoes WHERE data LIKE ?
-        GROUP BY categoria, tipo ORDER BY total DESC
-    """, (f"{mes}%",)).fetchall()
-
-    evolucao = db.execute("""
-        SELECT substr(data,1,7) as mes, tipo, SUM(valor) as total
-        FROM transacoes GROUP BY mes, tipo ORDER BY mes
-    """).fetchall()
-
-    ultimas = db.execute("""
-        SELECT * FROM transacoes ORDER BY criado_em DESC LIMIT 20
-    """).fetchall()
-
+    totais = db.execute("SELECT tipo, SUM(valor) as total FROM transacoes WHERE data LIKE ? GROUP BY tipo", (f"{mes}%",)).fetchall()
+    por_categoria = db.execute("SELECT categoria, tipo, SUM(valor) as total, COUNT(*) as qtd FROM transacoes WHERE data LIKE ? GROUP BY categoria, tipo ORDER BY total DESC", (f"{mes}%",)).fetchall()
+    evolucao = db.execute("SELECT substr(data,1,7) as mes, tipo, SUM(valor) as total FROM transacoes GROUP BY mes, tipo ORDER BY mes").fetchall()
+    ultimas = db.execute("SELECT * FROM transacoes ORDER BY criado_em DESC LIMIT 20").fetchall()
     db.close()
-
     receitas = next((r["total"] for r in totais if r["tipo"] == "receita"), 0)
     despesas = next((r["total"] for r in totais if r["tipo"] == "despesa"), 0)
-
-    return jsonify({
-        "saldo": receitas - despesas,
-        "receitas": receitas,
-        "despesas": despesas,
-        "por_categoria": [dict(r) for r in por_categoria],
-        "evolucao": [dict(r) for r in evolucao],
-        "ultimas": [dict(r) for r in ultimas]
-    })
+    return jsonify({"saldo": receitas - despesas, "receitas": receitas, "despesas": despesas, "por_categoria": [dict(r) for r in por_categoria], "evolucao": [dict(r) for r in evolucao], "ultimas": [dict(r) for r in ultimas]})
 
 @app.route("/api/transacoes", methods=["GET"])
 def api_transacoes():
     db = get_db()
     mes = request.args.get("mes", "")
     if mes:
-        rows = db.execute("SELECT * FROM transacoes WHERE data LIKE ? ORDER BY data DESC",
-                         (f"{mes}%",)).fetchall()
+        rows = db.execute("SELECT * FROM transacoes WHERE data LIKE ? ORDER BY data DESC", (f"{mes}%",)).fetchall()
     else:
         rows = db.execute("SELECT * FROM transacoes ORDER BY data DESC").fetchall()
     db.close()
